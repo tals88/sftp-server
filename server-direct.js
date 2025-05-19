@@ -110,6 +110,7 @@ const server = new Server({
         // Track open files and original filenames
         const openFiles = new Map();
         const originalFilenames = new Map(); // Map to track original filenames for uploads
+        const directoryWrites = new Map(); // Map to track writes to directory handles for chunked uploads
         let handleCount = 0;
 
         // Handle SFTP requests
@@ -289,36 +290,69 @@ const server = new Server({
             console.log(`WRITE: Creating a file in the directory instead`);
 
             try {
-              // Check if we have an original filename from a previous OPEN operation
-              let filename;
+              // Check if we already have an ongoing write for this handle
+              let fileInfo = directoryWrites.get(handleStr);
 
-              // Look for any original filenames in our tracking map
-              for (const [otherHandle, originalName] of originalFilenames.entries()) {
-                console.log(`Found original filename for handle ${otherHandle}: ${originalName}`);
-                filename = originalName;
-                // We'll use the first one we find
-                break;
+              if (!fileInfo || offset === 0) {
+                // This is a new file or the first chunk of a new file
+
+                // Check if we have an original filename from a previous OPEN operation
+                let filename;
+                let fileExtension = '';
+
+                // Look for any original filenames in our tracking map
+                for (const [otherHandle, originalName] of originalFilenames.entries()) {
+                  console.log(`Found original filename for handle ${otherHandle}: ${originalName}`);
+                  filename = originalName;
+
+                  // Extract the file extension from the original filename
+                  const extMatch = originalName.match(/\.([^.]+)$/);
+                  if (extMatch) {
+                    fileExtension = extMatch[0]; // Include the dot
+                  }
+
+                  // We'll use the first one we find
+                  break;
+                }
+
+                // If no original filename found, generate one with timestamp and preserve extension if available
+                if (!filename || offset === 0) {
+                  const timestamp = new Date().getTime();
+
+                  // If we have a file extension from a previous filename, use it
+                  if (!fileExtension) {
+                    fileExtension = '.bin'; // Default extension if none is found
+                  }
+
+                  filename = `upload_${timestamp}${fileExtension}`;
+                }
+
+                console.log(`Using filename for upload: ${filename}`);
+                const newFilePath = path.join(filePath, filename);
+                console.log(`WRITE: Creating file: ${newFilePath}`);
+
+                // Create or open the file
+                const newFd = fs.openSync(newFilePath, 'w');
+
+                // Store information about this file for future chunks
+                fileInfo = {
+                  fd: newFd,
+                  path: newFilePath,
+                  filename: filename,
+                  size: 0
+                };
+
+                directoryWrites.set(handleStr, fileInfo);
               }
 
-              // If no original filename found, generate one with timestamp
-              if (!filename) {
-                const timestamp = new Date().getTime();
-                filename = `upload_${timestamp}.txt`;
-              }
+              // Write the data at the appropriate offset
+              const bytesWritten = fs.writeSync(fileInfo.fd, data, 0, data.length, offset);
+              fileInfo.size = Math.max(fileInfo.size, offset + bytesWritten);
 
-              console.log(`Using filename for upload: ${filename}`);
-              const newFilePath = path.join(filePath, filename);
-              console.log(`WRITE: Creating file: ${newFilePath}`);
-
-              // Create the file and write the data
-              const newFd = fs.openSync(newFilePath, 'w');
-              const bytesWritten = fs.writeSync(newFd, data, 0, data.length, 0);
-              fs.closeSync(newFd);
-
-              console.log(`Successfully wrote ${bytesWritten} bytes to auto-generated file: ${newFilePath}`);
+              console.log(`Successfully wrote ${bytesWritten} bytes to file: ${fileInfo.path} at offset ${offset}`);
               return sftpStream.status(reqid, STATUS_CODE.OK);
             } catch (err) {
-              console.error(`Error creating file in directory ${filePath}:`, err);
+              console.error(`Error writing to file in directory ${filePath}:`, err);
               return sftpStream.status(reqid, STATUS_CODE.FAILURE);
             }
           }
@@ -362,6 +396,20 @@ const server = new Server({
             // Check if it's a directory or file
             if (entry.isDirectory === true) {
               console.log(`Directory closed: ${entry.path}`);
+
+              // Check if we have an ongoing directory write for this handle
+              if (directoryWrites.has(handleStr)) {
+                const fileInfo = directoryWrites.get(handleStr);
+
+                // Close the file descriptor if it exists
+                if (fileInfo && fileInfo.fd !== undefined && fileInfo.fd !== null) {
+                  fs.closeSync(fileInfo.fd);
+                  console.log(`Closed directory write file: ${fileInfo.path}`);
+                }
+
+                // Remove from directoryWrites map
+                directoryWrites.delete(handleStr);
+              }
             } else if (entry.fd !== undefined && entry.fd !== null) {
               // Close the file descriptor
               fs.closeSync(entry.fd);
@@ -780,8 +828,21 @@ const server = new Server({
             }
           }
 
+          // Close any open directory write files
+          for (const [handle, fileInfo] of directoryWrites.entries()) {
+            if (fileInfo && fileInfo.fd !== undefined && fileInfo.fd !== null) {
+              try {
+                fs.closeSync(fileInfo.fd);
+                console.log(`Closed directory write file: ${fileInfo.path}`);
+              } catch (err) {
+                console.error(`Error closing directory write file: ${fileInfo.path}`, err);
+              }
+            }
+          }
+
           openFiles.clear();
           originalFilenames.clear(); // Also clear the originalFilenames map
+          directoryWrites.clear(); // Clear the directoryWrites map
         });
 
         // Handle errors on the SFTP stream
@@ -802,8 +863,21 @@ const server = new Server({
             }
           }
 
+          // Close any open directory write files
+          for (const [handle, fileInfo] of directoryWrites.entries()) {
+            if (fileInfo && fileInfo.fd !== undefined && fileInfo.fd !== null) {
+              try {
+                fs.closeSync(fileInfo.fd);
+                console.log(`Closed directory write file: ${fileInfo.path} due to error`);
+              } catch (closeErr) {
+                console.error(`Error closing directory write file: ${fileInfo.path}`, closeErr);
+              }
+            }
+          }
+
           openFiles.clear();
           originalFilenames.clear(); // Also clear the originalFilenames map
+          directoryWrites.clear(); // Clear the directoryWrites map
         });
       });
     });
