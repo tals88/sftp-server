@@ -107,8 +107,9 @@ const server = new Server({
         console.log('SFTP subsystem requested');
         const sftpStream = accept();
 
-        // Track open files
+        // Track open files and original filenames
         const openFiles = new Map();
+        const originalFilenames = new Map(); // Map to track original filenames for uploads
         let handleCount = 0;
 
         // Handle SFTP requests
@@ -208,12 +209,19 @@ const server = new Server({
             handle.writeUInt32BE(handleCount++, 0);
             const handleStr = handle.toString('hex');
 
-            // Store the file descriptor
+            // Store the file descriptor and track the original filename
             openFiles.set(handleStr, {
               fd,
               path: fullPath,
               isDirectory: false
             });
+
+            // Store the original filename for potential use in uploads
+            const originalFilename = path.basename(filename);
+            if (originalFilename) {
+              originalFilenames.set(handleStr, originalFilename);
+              console.log(`Tracking original filename for handle ${handleStr}: ${originalFilename}`);
+            }
 
             console.log(`File opened: ${filename}, handle: ${handleStr}`);
             sftpStream.handle(reqid, handle);
@@ -281,9 +289,25 @@ const server = new Server({
             console.log(`WRITE: Creating a file in the directory instead`);
 
             try {
-              // Generate a unique filename based on timestamp
-              const timestamp = new Date().getTime();
-              const newFilePath = path.join(filePath, `upload_${timestamp}.dat`);
+              // Check if we have an original filename from a previous OPEN operation
+              let filename;
+
+              // Look for any original filenames in our tracking map
+              for (const [otherHandle, originalName] of originalFilenames.entries()) {
+                console.log(`Found original filename for handle ${otherHandle}: ${originalName}`);
+                filename = originalName;
+                // We'll use the first one we find
+                break;
+              }
+
+              // If no original filename found, generate one with timestamp
+              if (!filename) {
+                const timestamp = new Date().getTime();
+                filename = `upload_${timestamp}.txt`;
+              }
+
+              console.log(`Using filename for upload: ${filename}`);
+              const newFilePath = path.join(filePath, filename);
               console.log(`WRITE: Creating file: ${newFilePath}`);
 
               // Create the file and write the data
@@ -348,6 +372,13 @@ const server = new Server({
 
             // Remove the handle from our tracking
             openFiles.delete(handleStr);
+
+            // Also remove from originalFilenames if it exists
+            if (originalFilenames.has(handleStr)) {
+              console.log(`Removing original filename tracking for handle ${handleStr}`);
+              originalFilenames.delete(handleStr);
+            }
+
             sftpStream.status(reqid, STATUS_CODE.OK);
           } catch (err) {
             console.error(`Error closing handle ${handleStr}:`, err);
@@ -750,6 +781,7 @@ const server = new Server({
           }
 
           openFiles.clear();
+          originalFilenames.clear(); // Also clear the originalFilenames map
         });
 
         // Handle errors on the SFTP stream
@@ -771,6 +803,7 @@ const server = new Server({
           }
 
           openFiles.clear();
+          originalFilenames.clear(); // Also clear the originalFilenames map
         });
       });
     });
