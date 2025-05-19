@@ -187,9 +187,15 @@ const server = new Server({
                 if ((flags & OPEN_MODE.CREATE) && !fs.existsSync(fullPath)) {
                   fs.writeFileSync(fullPath, ''); // Create empty file
                 } else if (!fs.existsSync(fullPath)) {
-                  // If file doesn't exist and CREATE flag is not set, return error
-                  console.log(`File not found: ${filename}`);
-                  return sftpStream.status(reqid, STATUS_CODE.NO_SUCH_FILE);
+                  // Special handling for ERP systems that might try to upload to non-existent files
+                  if (flags & OPEN_MODE.WRITE) {
+                    console.log(`File not found but WRITE flag is set. Creating file: ${filename}`);
+                    fs.writeFileSync(fullPath, ''); // Create empty file
+                  } else {
+                    // If file doesn't exist and CREATE flag is not set, return error
+                    console.log(`File not found: ${filename}`);
+                    return sftpStream.status(reqid, STATUS_CODE.NO_SUCH_FILE);
+                  }
                 }
               }
             }
@@ -269,10 +275,28 @@ const server = new Server({
           const entry = openFiles.get(handleStr);
           const { fd, path: filePath, isDirectory } = entry;
 
-          // Check if this is a directory handle
+          // Special handling for directory handles - create a file in the directory
           if (isDirectory === true) {
-            console.log(`WRITE: Cannot write to directory handle: ${handleStr}, path: ${filePath}`);
-            return sftpStream.status(reqid, STATUS_CODE.PERMISSION_DENIED);
+            console.log(`WRITE: Detected write to directory handle: ${handleStr}, path: ${filePath}`);
+            console.log(`WRITE: Creating a file in the directory instead`);
+
+            try {
+              // Generate a unique filename based on timestamp
+              const timestamp = new Date().getTime();
+              const newFilePath = path.join(filePath, `upload_${timestamp}.dat`);
+              console.log(`WRITE: Creating file: ${newFilePath}`);
+
+              // Create the file and write the data
+              const newFd = fs.openSync(newFilePath, 'w');
+              const bytesWritten = fs.writeSync(newFd, data, 0, data.length, 0);
+              fs.closeSync(newFd);
+
+              console.log(`Successfully wrote ${bytesWritten} bytes to auto-generated file: ${newFilePath}`);
+              return sftpStream.status(reqid, STATUS_CODE.OK);
+            } catch (err) {
+              console.error(`Error creating file in directory ${filePath}:`, err);
+              return sftpStream.status(reqid, STATUS_CODE.FAILURE);
+            }
           }
 
           if (fd === undefined || fd === null) {
