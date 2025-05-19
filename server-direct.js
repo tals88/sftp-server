@@ -424,8 +424,13 @@ const server = new Server({
             const handle = Buffer.alloc(4);
             handle.writeUInt32BE(handleCount++, 0);
 
-            // Store the directory path
-            openFiles.set(handle.toString('hex'), { path: fullPath, files: null });
+            // Store the directory path with isDirectory flag
+            openFiles.set(handle.toString('hex'), {
+              path: fullPath,
+              files: null,
+              isDirectory: true,
+              fd: null
+            });
 
             console.log(`Directory opened: ${path}, handle: ${handle.toString('hex')}`);
             sftpStream.handle(reqid, handle);
@@ -708,13 +713,15 @@ const server = new Server({
 
           // Close any open files
           for (const [handle, entry] of openFiles.entries()) {
-            if (entry && entry.fd !== undefined) {
+            if (entry && entry.fd !== undefined && entry.fd !== null) {
               try {
                 fs.closeSync(entry.fd);
                 console.log(`Closed file with handle ${handle}`);
               } catch (err) {
                 console.error(`Error closing file with handle ${handle}:`, err);
               }
+            } else {
+              console.log(`Skipping close for directory or null fd handle: ${handle}`);
             }
           }
 
@@ -727,13 +734,15 @@ const server = new Server({
 
           // Close any open files on error
           for (const [handle, entry] of openFiles.entries()) {
-            if (entry && entry.fd !== undefined) {
+            if (entry && entry.fd !== undefined && entry.fd !== null) {
               try {
                 fs.closeSync(entry.fd);
                 console.log(`Closed file with handle ${handle} due to error`);
               } catch (closeErr) {
                 console.error(`Error closing file with handle ${handle}:`, closeErr);
               }
+            } else {
+              console.log(`Skipping close for directory or null fd handle: ${handle}`);
             }
           }
 
