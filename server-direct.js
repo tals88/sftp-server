@@ -113,13 +113,25 @@ const server = new Server({
 
         // Handle SFTP requests
         sftpStream.on('OPEN', (reqid, filename, flags, attrs) => {
-          console.log(`OPEN request for ${filename}`);
+          console.log(`OPEN request for ${filename} with flags: ${flags}`);
+
+          // Special handling for root directory
+          if (filename === '/' || filename === '') {
+            if (flags & OPEN_MODE.WRITE) {
+              console.log(`Rejecting write request to root directory`);
+              return sftpStream.status(reqid, STATUS_CODE.PERMISSION_DENIED);
+            }
+
+            // For read-only access to root, we'll handle it as a directory later
+            console.log(`Root directory requested for reading`);
+          }
 
           // Normalize the filename (remove leading slash)
           const normalizedFilename = filename.startsWith('/') ? filename.substring(1) : filename;
 
           // Resolve the full path
           const fullPath = path.join(userDir, normalizedFilename.replace(/\//g, path.sep));
+          console.log(`Resolved path: ${fullPath}`);
 
           try {
             // Check if the path is within the user's directory
@@ -127,6 +139,29 @@ const server = new Server({
             if (relativePath.startsWith('..') || path.isAbsolute(relativePath)) {
               console.log(`Access denied: ${filename} is outside user directory`);
               return sftpStream.status(reqid, STATUS_CODE.PERMISSION_DENIED);
+            }
+
+            // Check if this is a directory
+            if (fs.existsSync(fullPath) && fs.statSync(fullPath).isDirectory()) {
+              if (flags & OPEN_MODE.WRITE) {
+                console.log(`Rejecting write request to directory: ${filename}`);
+                return sftpStream.status(reqid, STATUS_CODE.PERMISSION_DENIED);
+              }
+
+              // For directories, we'll use a special marker instead of a file descriptor
+              const handle = Buffer.alloc(4);
+              handle.writeUInt32BE(handleCount++, 0);
+              const handleStr = handle.toString('hex');
+
+              // Store directory info with a null fd to indicate it's a directory
+              openFiles.set(handleStr, {
+                fd: null,
+                path: fullPath,
+                isDirectory: true
+              });
+
+              console.log(`Directory opened: ${filename}, handle: ${handleStr}`);
+              return sftpStream.handle(reqid, handle);
             }
 
             // Create parent directories if they don't exist (for writing)
@@ -151,6 +186,10 @@ const server = new Server({
                 // Create the file if it doesn't exist and CREATE flag is set
                 if ((flags & OPEN_MODE.CREATE) && !fs.existsSync(fullPath)) {
                   fs.writeFileSync(fullPath, ''); // Create empty file
+                } else if (!fs.existsSync(fullPath)) {
+                  // If file doesn't exist and CREATE flag is not set, return error
+                  console.log(`File not found: ${filename}`);
+                  return sftpStream.status(reqid, STATUS_CODE.NO_SUCH_FILE);
                 }
               }
             }
@@ -161,11 +200,16 @@ const server = new Server({
             // Create a handle
             const handle = Buffer.alloc(4);
             handle.writeUInt32BE(handleCount++, 0);
+            const handleStr = handle.toString('hex');
 
             // Store the file descriptor
-            openFiles.set(handle.toString('hex'), { fd, path: fullPath });
+            openFiles.set(handleStr, {
+              fd,
+              path: fullPath,
+              isDirectory: false
+            });
 
-            console.log(`File opened: ${filename}, handle: ${handle.toString('hex')}`);
+            console.log(`File opened: ${filename}, handle: ${handleStr}`);
             sftpStream.handle(reqid, handle);
           } catch (err) {
             console.error(`Error opening file ${filename}:`, err);
@@ -175,17 +219,32 @@ const server = new Server({
 
         sftpStream.on('READ', (reqid, handle, offset, length) => {
           const handleStr = handle.toString('hex');
+          console.log(`READ request for handle: ${handleStr}, offset: ${offset}, length: ${length}`);
 
           if (!openFiles.has(handleStr)) {
             console.log(`READ: Invalid handle: ${handleStr}`);
             return sftpStream.status(reqid, STATUS_CODE.FAILURE);
           }
 
-          const { fd, path: filePath } = openFiles.get(handleStr);
+          const entry = openFiles.get(handleStr);
+          const { fd, path: filePath, isDirectory } = entry;
+
+          // Check if this is a directory handle
+          if (isDirectory === true) {
+            console.log(`READ: Cannot read from directory handle: ${handleStr}, path: ${filePath}`);
+            return sftpStream.status(reqid, STATUS_CODE.PERMISSION_DENIED);
+          }
+
+          if (fd === undefined || fd === null) {
+            console.log(`READ: Handle ${handleStr} does not have a valid file descriptor`);
+            return sftpStream.status(reqid, STATUS_CODE.FAILURE);
+          }
 
           try {
             const buffer = Buffer.alloc(length);
             const bytesRead = fs.readSync(fd, buffer, 0, length, offset);
+
+            console.log(`Read ${bytesRead} bytes from ${filePath} at offset ${offset}`);
 
             if (bytesRead === 0) {
               return sftpStream.status(reqid, STATUS_CODE.EOF);
@@ -193,7 +252,7 @@ const server = new Server({
 
             sftpStream.data(reqid, bytesRead === length ? buffer : buffer.slice(0, bytesRead));
           } catch (err) {
-            console.error(`Error reading file:`, err);
+            console.error(`Error reading file ${filePath}:`, err);
             sftpStream.status(reqid, STATUS_CODE.FAILURE);
           }
         });
@@ -207,9 +266,16 @@ const server = new Server({
             return sftpStream.status(reqid, STATUS_CODE.FAILURE);
           }
 
-          const { fd, path: filePath } = openFiles.get(handleStr);
+          const entry = openFiles.get(handleStr);
+          const { fd, path: filePath, isDirectory } = entry;
 
-          if (fd === undefined) {
+          // Check if this is a directory handle
+          if (isDirectory === true) {
+            console.log(`WRITE: Cannot write to directory handle: ${handleStr}, path: ${filePath}`);
+            return sftpStream.status(reqid, STATUS_CODE.PERMISSION_DENIED);
+          }
+
+          if (fd === undefined || fd === null) {
             console.log(`WRITE: Handle ${handleStr} does not have a valid file descriptor`);
             return sftpStream.status(reqid, STATUS_CODE.FAILURE);
           }
@@ -235,6 +301,7 @@ const server = new Server({
 
         sftpStream.on('CLOSE', (reqid, handle) => {
           const handleStr = handle.toString('hex');
+          console.log(`CLOSE request for handle: ${handleStr}`);
 
           if (!openFiles.has(handleStr)) {
             console.log(`CLOSE: Invalid handle: ${handleStr}`);
@@ -244,19 +311,22 @@ const server = new Server({
           const entry = openFiles.get(handleStr);
 
           try {
-            // If it's a file with a file descriptor, close it
-            if (entry.fd !== undefined) {
+            // Check if it's a directory or file
+            if (entry.isDirectory === true) {
+              console.log(`Directory closed: ${entry.path}`);
+            } else if (entry.fd !== undefined && entry.fd !== null) {
+              // Close the file descriptor
               fs.closeSync(entry.fd);
               console.log(`File closed: ${entry.path}`);
             } else {
-              console.log(`Directory closed: ${entry.path}`);
+              console.log(`Closed handle with no file descriptor: ${handleStr}`);
             }
 
             // Remove the handle from our tracking
             openFiles.delete(handleStr);
             sftpStream.status(reqid, STATUS_CODE.OK);
           } catch (err) {
-            console.error(`Error closing handle:`, err);
+            console.error(`Error closing handle ${handleStr}:`, err);
             sftpStream.status(reqid, STATUS_CODE.FAILURE);
           }
         });
