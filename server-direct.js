@@ -137,10 +137,25 @@ const server = new Server({
               }
             }
 
-            // Open the file
-            const mode = flags & OPEN_MODE.READ ? 'r' :
-                        flags & OPEN_MODE.WRITE ? 'w' : 'r';
+            // Open the file with the appropriate mode
+            let mode = 'r'; // Default to read mode
 
+            if (flags & OPEN_MODE.WRITE) {
+              if (flags & OPEN_MODE.APPEND) {
+                mode = 'a'; // Append mode
+              } else if (flags & OPEN_MODE.TRUNCATE) {
+                mode = 'w'; // Write mode (truncate)
+              } else {
+                mode = 'r+'; // Read and write mode (no truncate)
+
+                // Create the file if it doesn't exist and CREATE flag is set
+                if ((flags & OPEN_MODE.CREATE) && !fs.existsSync(fullPath)) {
+                  fs.writeFileSync(fullPath, ''); // Create empty file
+                }
+              }
+            }
+
+            console.log(`Opening file ${filename} with mode: ${mode}`);
             const fd = fs.openSync(fullPath, mode);
 
             // Create a handle
@@ -185,6 +200,7 @@ const server = new Server({
 
         sftpStream.on('WRITE', (reqid, handle, offset, data) => {
           const handleStr = handle.toString('hex');
+          console.log(`WRITE request for handle: ${handleStr}, offset: ${offset}, length: ${data.length}`);
 
           if (!openFiles.has(handleStr)) {
             console.log(`WRITE: Invalid handle: ${handleStr}`);
@@ -193,11 +209,26 @@ const server = new Server({
 
           const { fd, path: filePath } = openFiles.get(handleStr);
 
+          if (fd === undefined) {
+            console.log(`WRITE: Handle ${handleStr} does not have a valid file descriptor`);
+            return sftpStream.status(reqid, STATUS_CODE.FAILURE);
+          }
+
           try {
-            fs.writeSync(fd, data, 0, data.length, offset);
+            // Ensure the file is large enough for the write at the given offset
+            const stats = fs.fstatSync(fd);
+            if (offset > stats.size) {
+              // If writing beyond the end of the file, fill the gap with zeros
+              const buffer = Buffer.alloc(offset - stats.size);
+              fs.writeSync(fd, buffer, 0, buffer.length, stats.size);
+            }
+
+            // Now write the actual data
+            const bytesWritten = fs.writeSync(fd, data, 0, data.length, offset);
+            console.log(`Successfully wrote ${bytesWritten} bytes to ${filePath} at offset ${offset}`);
             sftpStream.status(reqid, STATUS_CODE.OK);
           } catch (err) {
-            console.error(`Error writing file:`, err);
+            console.error(`Error writing file ${filePath}:`, err);
             sftpStream.status(reqid, STATUS_CODE.FAILURE);
           }
         });
@@ -606,13 +637,32 @@ const server = new Server({
           console.log('SFTP session ended');
 
           // Close any open files
-          for (const [handle, { fd }] of openFiles.entries()) {
-            if (fd) {
+          for (const [handle, entry] of openFiles.entries()) {
+            if (entry && entry.fd !== undefined) {
               try {
-                fs.closeSync(fd);
+                fs.closeSync(entry.fd);
                 console.log(`Closed file with handle ${handle}`);
               } catch (err) {
                 console.error(`Error closing file with handle ${handle}:`, err);
+              }
+            }
+          }
+
+          openFiles.clear();
+        });
+
+        // Handle errors on the SFTP stream
+        sftpStream.on('error', (err) => {
+          console.error('SFTP stream error:', err);
+
+          // Close any open files on error
+          for (const [handle, entry] of openFiles.entries()) {
+            if (entry && entry.fd !== undefined) {
+              try {
+                fs.closeSync(entry.fd);
+                console.log(`Closed file with handle ${handle} due to error`);
+              } catch (closeErr) {
+                console.error(`Error closing file with handle ${handle}:`, closeErr);
               }
             }
           }
