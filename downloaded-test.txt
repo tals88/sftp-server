@@ -1,6 +1,0 @@
-This is a test file for the SFTP server.
-You can access this file using an SFTP client with the following credentials:
-- Host: localhost
-- Port: 2222
-- Username: testuser
-- Password: password123

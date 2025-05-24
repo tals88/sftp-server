@@ -2,8 +2,9 @@
 node_modules/
 
 # Runtime data
-storage/*
-!storage/test.txt
+storage/users/*/
+storage/users.db.json
+storage/logs/
 
 # Environment variables
 .env
@@ -22,3 +23,15 @@ npm-debug.log*
 # OS files
 .DS_Store
 Thumbs.db
+
+# Private keys and sensitive files
+tal.pem
+*.pem
+keys/host.key
+keys/host.key.pub
+
+# Keep directory structure but ignore user data
+!storage/
+!storage/users/
+!keys/
+!keys/.gitkeep
