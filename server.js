@@ -1,75 +1,114 @@
 const fs = require('fs');
 const path = require('path');
 const { Server } = require('ssh2');
-const SftpServer = require('ssh2-sftp-server');
-const { timingSafeEqual } = require('crypto');
+const config = require('./config');
+const UserManager = require('./user-manager');
+const { setupSftpHandlers } = require('./sftp-handlers');
 
-// Configuration
-const PORT = 2222;
-const STORAGE_DIR = path.join(__dirname, 'storage');
-
-// Create storage directory if it doesn't exist
-if (!fs.existsSync(STORAGE_DIR)) {
-  fs.mkdirSync(STORAGE_DIR);
-}
-
-// Predefined user credentials
-const USERS = {
-  'testuser': {
-    password: 'password123',
-    directory: STORAGE_DIR
-  }
+// Define SFTP constants
+const OPEN_MODE = {
+  READ: 0x00000001,
+  WRITE: 0x00000002,
+  APPEND: 0x00000004,
+  CREATE: 0x00000008,
+  TRUNCATE: 0x00000010,
+  EXCL: 0x00000020
 };
 
-// Helper function for secure comparison
-function checkValue(input, allowed) {
-  const autoReject = (input.length !== allowed.length);
-  if (autoReject) {
-    // Prevent leaking length information by always making a comparison with the
-    // same input when lengths don't match what we expect
-    allowed = input;
+const STATUS_CODE = {
+  OK: 0,
+  EOF: 1,
+  NO_SUCH_FILE: 2,
+  PERMISSION_DENIED: 3,
+  FAILURE: 4,
+  BAD_MESSAGE: 5,
+  NO_CONNECTION: 6,
+  CONNECTION_LOST: 7,
+  OP_UNSUPPORTED: 8
+};
+
+// Initialize user manager
+const userManager = new UserManager();
+
+// Logging helper
+function log(level, message, meta = {}) {
+  const timestamp = new Date().toISOString();
+  const logEntry = {
+    timestamp,
+    level,
+    message,
+    ...meta
+  };
+
+  if (config.logging.file) {
+    // TODO: Implement file logging
+    console.log(JSON.stringify(logEntry));
+  } else {
+    console.log(`[${timestamp}] ${level.toUpperCase()}: ${message}`, meta.username ? `(user: ${meta.username})` : '');
   }
-  const isMatch = timingSafeEqual(Buffer.from(input), Buffer.from(allowed));
-  return (!autoReject && isMatch);
+}
+
+// Utility functions
+function validatePath(userDir, requestedPath) {
+  const normalizedPath = requestedPath.startsWith('/') ? requestedPath.substring(1) : requestedPath;
+  const fullPath = path.join(userDir, normalizedPath.replace(/\//g, path.sep));
+  const relativePath = path.relative(userDir, fullPath);
+
+  if (relativePath.startsWith('..') || path.isAbsolute(relativePath)) {
+    return { valid: false, error: 'Path outside user directory' };
+  }
+
+  return { valid: true, fullPath, relativePath };
+}
+
+function checkPermission(user, operation) {
+  return user.permissions[operation] === true;
+}
+
+function checkQuota(username, additionalSize = 0) {
+  return userManager.checkQuota(username, additionalSize);
 }
 
 // Create SSH server
 const server = new Server({
-  hostKeys: [fs.readFileSync(path.join(__dirname, 'keys', 'host.key'))]
+  hostKeys: [fs.readFileSync(config.server.hostKeyPath)]
 }, (client) => {
-  console.log('Client connected!');
+  log('info', 'Client connected', { clientIP: client._sock.remoteAddress });
+
+  let authenticatedUser = null;
 
   // Handle authentication
-  client.on('authentication', (ctx) => {
+  client.on('authentication', async (ctx) => {
     const username = ctx.username;
-    const user = USERS[username];
 
-    // Check if user exists
-    if (!user) {
-      console.log(`Authentication failed: Unknown user ${username}`);
-      return ctx.reject();
-    }
+    log('info', 'Authentication attempt', { username, method: ctx.method });
 
     // Only allow password authentication
     if (ctx.method !== 'password') {
-      console.log(`Authentication failed: Unsupported method ${ctx.method}`);
+      log('warn', 'Unsupported authentication method', { username, method: ctx.method });
       return ctx.reject(['password']);
     }
 
-    // Check password
-    if (!checkValue(ctx.password, user.password)) {
-      console.log(`Authentication failed: Invalid password for user ${username}`);
-      return ctx.reject();
-    }
+    try {
+      const authResult = await userManager.authenticateUser(username, ctx.password);
 
-    // Authentication successful
-    console.log(`User ${username} authenticated successfully`);
-    ctx.accept();
+      if (authResult.success) {
+        authenticatedUser = authResult.user;
+        log('info', 'Authentication successful', { username });
+        ctx.accept();
+      } else {
+        log('warn', 'Authentication failed', { username, reason: authResult.reason });
+        ctx.reject();
+      }
+    } catch (error) {
+      log('error', 'Authentication error', { username, error: error.message });
+      ctx.reject();
+    }
   });
 
   // Handle client ready event
   client.on('ready', () => {
-    console.log('Client authenticated and ready');
+    log('info', 'Client authenticated and ready', { username: authenticatedUser.username });
 
     // Handle session requests
     client.on('session', (accept) => {
@@ -77,15 +116,64 @@ const server = new Server({
 
       // Handle SFTP subsystem requests
       session.on('sftp', (accept) => {
-        console.log('SFTP subsystem requested');
+        log('info', 'SFTP subsystem requested', { username: authenticatedUser.username });
         const sftpStream = accept();
-        
-        // Create a new SFTP server instance
-        const sftpServer = new SftpServer(sftpStream);
-        
-        // Log when the SFTP session ends
+
+        // Track open files
+        const openFiles = new Map();
+        let handleCount = 0;
+
+        // Helper function to create file handle
+        function createHandle() {
+          const handle = Buffer.alloc(4);
+          handle.writeUInt32BE(handleCount++, 0);
+          return handle;
+        }
+
+        // Setup SFTP handlers
+        setupSftpHandlers(
+          sftpStream,
+          authenticatedUser,
+          openFiles,
+          createHandle,
+          log,
+          validatePath,
+          checkPermission,
+          checkQuota
+        );
+
+        // Handle SFTP session end
         sftpStream.on('end', () => {
-          console.log('SFTP session ended');
+          log('info', 'SFTP session ended', { username: authenticatedUser.username });
+
+          // Close any open files
+          for (const [handle, entry] of openFiles.entries()) {
+            if (entry && entry.fd !== undefined && entry.fd !== null) {
+              try {
+                fs.closeSync(entry.fd);
+              } catch (err) {
+                log('error', 'Error closing file on session end', { username: authenticatedUser.username, handle, error: err.message });
+              }
+            }
+          }
+          openFiles.clear();
+        });
+
+        // Handle SFTP stream errors
+        sftpStream.on('error', (err) => {
+          log('error', 'SFTP stream error', { username: authenticatedUser.username, error: err.message });
+
+          // Close any open files on error
+          for (const [handle, entry] of openFiles.entries()) {
+            if (entry && entry.fd !== undefined && entry.fd !== null) {
+              try {
+                fs.closeSync(entry.fd);
+              } catch (closeErr) {
+                log('error', 'Error closing file on stream error', { username: authenticatedUser.username, handle, error: closeErr.message });
+              }
+            }
+          }
+          openFiles.clear();
         });
       });
     });
@@ -93,18 +181,35 @@ const server = new Server({
 
   // Handle client disconnection
   client.on('close', () => {
-    console.log('Client disconnected');
+    log('info', 'Client disconnected', { username: authenticatedUser ? authenticatedUser.username : 'unknown' });
   });
 
   // Handle errors
   client.on('error', (err) => {
-    console.error('Client error:', err);
+    log('error', 'Client error', { username: authenticatedUser ? authenticatedUser.username : 'unknown', error: err.message });
   });
 });
 
 // Start the server
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`SFTP server listening on port ${PORT}`);
-  console.log(`Predefined user: testuser / password123`);
-  console.log(`Storage directory: ${STORAGE_DIR}`);
+server.listen(config.server.port, config.server.host, () => {
+  log('info', `SFTP server listening on ${config.server.host}:${config.server.port}`);
+  log('info', `Storage base directory: ${config.storage.baseDir}`);
+  log('info', `Environment: ${config.env}`);
+});
+
+// Graceful shutdown
+process.on('SIGINT', () => {
+  log('info', 'Received SIGINT, shutting down gracefully');
+  server.close(() => {
+    log('info', 'Server closed');
+    process.exit(0);
+  });
+});
+
+process.on('SIGTERM', () => {
+  log('info', 'Received SIGTERM, shutting down gracefully');
+  server.close(() => {
+    log('info', 'Server closed');
+    process.exit(0);
+  });
 });

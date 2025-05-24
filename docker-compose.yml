@@ -1,0 +1,51 @@
+version: '3.8'
+
+services:
+  sftp-server:
+    build: .
+    container_name: secure-sftp-server
+    ports:
+      - "2222:2222"
+    environment:
+      - NODE_ENV=production
+      - SFTP_PORT=2222
+      - SFTP_HOST=0.0.0.0
+      - STORAGE_BASE_DIR=/app/storage
+      - USERS_DB_PATH=/app/data/users.json
+      - HOST_KEY_PATH=/app/keys/host.key
+      - MAX_FILE_SIZE=104857600
+      - MAX_LOGIN_ATTEMPTS=5
+      - LOCKOUT_DURATION=900000
+      - SESSION_TIMEOUT=1800000
+      - BCRYPT_SALT_ROUNDS=12
+      - LOG_LEVEL=info
+      - ADMIN_USERNAME=admin
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-changeme123}
+    volumes:
+      - sftp_data:/app/data
+      - sftp_storage:/app/storage
+      - sftp_keys:/app/keys
+      - sftp_logs:/app/logs
+    restart: unless-stopped
+    networks:
+      - sftp_network
+    healthcheck:
+      test: ["CMD", "node", "-e", "const net = require('net'); const client = net.createConnection(2222, 'localhost'); client.on('connect', () => { client.end(); process.exit(0); }); client.on('error', () => process.exit(1));"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+volumes:
+  sftp_data:
+    driver: local
+  sftp_storage:
+    driver: local
+  sftp_keys:
+    driver: local
+  sftp_logs:
+    driver: local
+
+networks:
+  sftp_network:
+    driver: bridge

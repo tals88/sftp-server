@@ -1,0 +1,21 @@
+{
+  "testuser": {
+    "id": "0d6a0f0c-178b-4cf5-b2b2-825372f15a39",
+    "username": "testuser",
+    "passwordHash": "$2b$12$Edf.e7MbpctdR1K2Ao11curabgZbtc.iVwci2A9d50lb6Yh8LhTvW",
+    "directory": "storage/testuser",
+    "createdAt": "2025-05-23T07:59:10.329Z",
+    "lastLogin": null,
+    "isActive": true,
+    "permissions": {
+      "read": true,
+      "write": true,
+      "delete": true,
+      "createDir": true
+    },
+    "quota": {
+      "maxSize": 104857600,
+      "currentSize": 0
+    }
+  }
+}
